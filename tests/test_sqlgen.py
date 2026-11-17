@@ -1,6 +1,8 @@
 """SQL rendering guarantees: deferrability preserved, cycles via post-data FKs."""
 from __future__ import annotations
 
+import json
+
 from app.models import (
     Column,
     ForeignKey,
@@ -173,3 +175,77 @@ def test_null_emitted_explicitly_and_quoted():
     null_pkg = build_package({"n": null_ts}, ["n"], null_specs, null_data)
     assert any(r["v"] is None for r in null_data["n"])
     assert "NULL" in null_pkg["02_data.sql"]
+
+
+def test_nnd_clause_rendered_verbatim_and_ordinary_unique_unclaused():
+    nnd_ts = TableSchema(
+        schema_name="public",
+        name="t",
+        columns=[_col("id"), _col("k", nullable=True)],
+        unique_constraints=[
+            UniqueConstraint(name="pk", columns=["id"], is_primary=True),
+            UniqueConstraint(
+                name="uk_nnd", columns=["k"], is_primary=False,
+                nulls_not_distinct=True,
+            ),
+            UniqueConstraint(
+                name="uk_plain", columns=["k"], is_primary=False,
+                nulls_not_distinct=False,
+            ),
+        ],
+        foreign_keys=[],
+    )
+    specs = {
+        "t": TableSpec(
+            table="t", rows=2,
+            ranges={"id": IntRange(low=1, high=2), "k": IntRange(low=7, high=7)},
+        )
+    }
+    # Two rows with one non-NULL value: NND allows exactly one NULL here.
+    data = Generator({"t": nnd_ts}, specs).solve()
+    pkg = build_package({"t": nnd_ts}, ["t"], specs, data)
+    ddl = pkg["01_schema.sql"]
+    assert 'CONSTRAINT "uk_nnd" UNIQUE NULLS NOT DISTINCT ("k")' in ddl
+    assert 'CONSTRAINT "uk_plain" UNIQUE ("k")' in ddl
+    assert 'PRIMARY KEY ("id")' in ddl
+    manifest = json.loads(pkg["manifest.json"])
+    unique_inv = {u["name"]: u for u in manifest["constraints"]["t"]["unique"]}
+    assert unique_inv["uk_nnd"]["nulls_not_distinct"] is True
+    assert unique_inv["uk_nnd"]["null_semantics"] == "NULLS NOT DISTINCT"
+    assert unique_inv["uk_plain"]["nulls_not_distinct"] is False
+
+
+def test_nnd_composite_clause_rendered():
+    ts = TableSchema(
+        schema_name="public",
+        name="t",
+        columns=[
+            _col("id"),
+            _col("a", nullable=True),
+            _col("b", nullable=True),
+        ],
+        unique_constraints=[
+            UniqueConstraint(name="pk", columns=["id"], is_primary=True),
+            UniqueConstraint(
+                name="uk_ab_nnd", columns=["a", "b"], is_primary=False,
+                nulls_not_distinct=True,
+            ),
+        ],
+        foreign_keys=[],
+    )
+    specs = {
+        "t": TableSpec(
+            table="t", rows=3,
+            ranges={
+                "id": IntRange(low=1, high=10),
+                "a": IntRange(low=1, high=3),
+                "b": IntRange(low=1, high=3),
+            },
+        )
+    }
+    data = Generator({"t": ts}, specs).solve()
+    pkg = build_package({"t": ts}, ["t"], specs, data)
+    assert (
+        'CONSTRAINT "uk_ab_nnd" UNIQUE NULLS NOT DISTINCT ("a", "b")'
+        in pkg["01_schema.sql"]
+    )

@@ -3,6 +3,11 @@
 Only ``pg_catalog`` / ``information_schema`` views are queried. No user table
 is ever scanned. Any structure outside the supported feature set produces a
 structured rejection instead of being silently ignored.
+
+For unique constraints the NULL uniqueness is read from
+``pg_index.indnullsnotdistinct`` (the catalog location available on
+PostgreSQL 15/16; the column ``pg_constraint.connullsnotdistinct`` only exists
+from PostgreSQL 17) via the constraint's backing index ``conindid``.
 """
 from __future__ import annotations
 
@@ -165,6 +170,7 @@ def _introspect_constraints(
                   JOIN pg_catalog.pg_attribute a
                     ON a.attrelid = con.conrelid AND a.attnum = u.attnum) AS cols,
                con.conindid,
+               COALESCE(ix.indnullsnotdistinct, false) AS nulls_not_distinct,
                con.condeferrable, con.condeferred, con.confmatchtype,
                con.confupdtype, con.confdeltype,
                (SELECT array_agg(a2.attname ORDER BY u2.ord)
@@ -176,6 +182,7 @@ def _introspect_constraints(
         FROM pg_catalog.pg_constraint con
         JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        LEFT JOIN pg_catalog.pg_index ix ON ix.indexrelid = con.conindid
         LEFT JOIN pg_catalog.pg_class fc ON fc.oid = con.confrelid
         LEFT JOIN pg_catalog.pg_namespace fn ON fn.oid = fc.relnamespace
         WHERE n.nspname = %s AND c.relname = %s
@@ -189,6 +196,7 @@ def _introspect_constraints(
         contype,
         cols,
         conindid,
+        nulls_not_distinct,
         deferrable,
         deferred,
         matchtype,
@@ -209,7 +217,14 @@ def _introspect_constraints(
                 rej.append((obj, "唯一/主键约束包含非整数列（已因类型被拒绝），无法保留该约束"))
                 continue
             uniques.append(
-                UniqueConstraint(name=conname, columns=list(cols), is_primary=(contype == "p"))
+                UniqueConstraint(
+                    name=conname,
+                    columns=list(cols),
+                    is_primary=(contype == "p"),
+                    # Primary keys are NOT NULL by definition; the catalog flag
+                    # is only meaningful for ordinary UNIQUE constraints.
+                    nulls_not_distinct=bool(nulls_not_distinct) and contype == "u",
+                )
             )
         elif contype == "f":
             if fschema != schema:

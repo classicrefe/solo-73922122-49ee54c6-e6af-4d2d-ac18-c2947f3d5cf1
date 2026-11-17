@@ -6,6 +6,7 @@ import zipfile
 from io import BytesIO
 
 import psycopg
+import pytest
 from fastapi.testclient import TestClient
 
 from app.jobs import STORE, package_zip, run_job
@@ -182,3 +183,87 @@ def test_more_than_max_tables_rejected():
         },
     )
     assert r.status_code == 422
+
+
+def test_nnd_conflict_job_fails_without_package():
+    # Reported regression shape: 3 rows on a nullable NND key pinned to [7,7].
+    jid, job = _run(_load("request_nnd_conflict.json"))
+    assert job.status == JobStatus.FAILED
+    conflict = job.conflict.model_dump()
+    assert conflict["kind"] == "no_solution"
+    joined = json.dumps(conflict, ensure_ascii=False)
+    assert "NULLS NOT DISTINCT" in joined
+    assert "[7, 7]" in joined
+    assert "ticket_locator_nnd_uk" in joined
+    # No relaxed package is ever published for an unsatisfiable request.
+    assert STORE.package(jid) is None
+    r = client.get(f"/jobs/{jid}/download")
+    assert r.status_code == 409
+
+
+def test_nnd_feasible_job_publishes_and_loads(fresh_verify_database):
+    jid, job = _run(_load("request_nnd_feasible.json"))
+    assert job.status == JobStatus.SUCCEEDED
+    pkg = STORE.package(jid)
+    # The rebuilt DDL keeps the source constraint exactly: no silent relaxation
+    # to an ordinary UNIQUE.
+    assert "UNIQUE NULLS NOT DISTINCT" in pkg["01_schema.sql"]
+    manifest = json.loads(pkg["manifest.json"])
+    unique = {
+        u["name"]: u
+        for u in manifest["constraints"]["ticket"]["unique"]
+    }
+    assert unique["ticket_locator_nnd_uk"]["nulls_not_distinct"] is True
+    assert unique["ticket_locator_uk"]["nulls_not_distinct"] is False
+
+    # Real load into a freshly created empty database must succeed, and the
+    # NND constraint must reject a duplicate NULL while ordinary UNIQUE
+    # accepts one.
+    dsn, _ = fresh_verify_database
+    with psycopg.connect(dsn, autocommit=False) as conn:
+        for f in ("01_schema.sql", "02_data.sql", "03_constraints.sql"):
+            conn.cursor().execute(pkg[f])
+        conn.commit()
+        cur = conn.cursor()
+        cur.execute("SELECT count(*) FROM public.ticket")
+        assert cur.fetchone()[0] == 4
+        cur.execute("SELECT count(*) FROM public.ticket WHERE locator_nnd IS NULL")
+        null_rows = cur.fetchone()[0]
+        # NND: at most one row may carry a NULL locator_nnd.
+        assert null_rows <= 1
+        cur.execute("SELECT locator_nnd FROM public.ticket WHERE locator_nnd IS NOT NULL")
+        used_nnd = {r[0] for r in cur.fetchall()}
+        free_nnd = next(v for v in range(70, 80) if v not in used_nnd)
+        if null_rows == 0:
+            # First NULL-bearing NND key: legal under NULLS NOT DISTINCT.
+            conn.cursor().execute(
+                "INSERT INTO public.ticket (ticket_id, tenant_ref, "
+                "locator_nnd, locator_uk) VALUES (997, 9, NULL, 91)"
+            )
+            conn.commit()
+        # A second all-NULL NND key must be rejected with 23505 regardless of
+        # whether the first NULL came from the sample or the insert above.
+        with pytest.raises(psycopg.Error) as exc:
+            conn.cursor().execute(
+                "INSERT INTO public.ticket (ticket_id, tenant_ref, "
+                "locator_nnd, locator_uk) VALUES (999, 9, NULL, 92)"
+            )
+        assert exc.value.sqlstate == "23505"
+        conn.rollback()
+        # Ordinary UNIQUE: another NULL locator_uk is accepted. Use an unused
+        # NND value and fresh tenant_ref so only ordinary-UNIQUE NULL semantics
+        # are being exercised.
+        conn.cursor().execute(
+            "INSERT INTO public.ticket (ticket_id, tenant_ref, "
+            "locator_nnd, locator_uk) VALUES (998, 8, %s, NULL)",
+            (free_nnd,),
+        )
+        conn.commit()
+
+
+def test_nnd_negative_probes_recorded_in_verify_log():
+    jid, job = _run(_load("request_nnd_feasible.json"))
+    assert job.status == JobStatus.SUCCEEDED
+    log = "\n".join(job.log)
+    assert "ticket_locator_nnd_uk 重复NULL" in log
+    assert "普通UNIQUE 允许重复NULL" in log

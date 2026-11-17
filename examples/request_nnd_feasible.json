@@ -1,0 +1,16 @@
+{
+  "_comment": "NULL 唯一性对照可行示例：ticket 请求 4 行。locator_nnd 受 UNIQUE NULLS NOT DISTINCT 约束（单列与复合键各一），含 NULL 的键至多一次；locator_uk 是普通 UNIQUE，多个 NULL 互不冲突。区间给足 4 个非空取值，求解器应在 NND 键上给出互不相同的三值键并最多使用一次 NULL，普通 UNIQUE 列则可重复 NULL，包内 DDL 原样保留 NULLS NOT DISTINCT 子句并通过隔离空库装载与负向校验。",
+  "schema_name": "public",
+  "tables": [
+    {
+      "table": "ticket",
+      "rows": 4,
+      "ranges": {
+        "ticket_id":   {"low": 1, "high": 100},
+        "tenant_ref":  {"low": 1, "high": 9},
+        "locator_nnd": {"low": 70, "high": 80},
+        "locator_uk":  {"low": 90, "high": 90}
+      }
+    }
+  ]
+}

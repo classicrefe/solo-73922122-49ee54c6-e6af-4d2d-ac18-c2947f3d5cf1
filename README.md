@@ -11,6 +11,11 @@
 
 - 整数列：`smallint` / `integer` / `bigint`
 - 主键（含复合主键）、普通 `UNIQUE` 唯一键（含复合）
+- 唯一键的 NULL 语义按源约束原样保留：
+  - 普通 `UNIQUE`：多个 NULL 互不冲突（SQL 标准语义）
+  - `UNIQUE NULLS NOT DISTINCT`（PostgreSQL 15+，单列与复合键均支持）：
+    NULL 视为相等，含 NULL 的键至多出现一次；重建 DDL 时原样输出该子句，
+    求解与隔离库负向校验均按此语义执行，绝不会静默放宽为普通 UNIQUE
 - `NOT NULL` 与可空列，完整保留 NULL 语义（SQL 唯一键中多个 NULL 互不冲突）
 - 复合外键 `MATCH SIMPLE` 与 `MATCH FULL`
 - 自引用外键、跨表循环外键（含传递闭包）
@@ -85,10 +90,10 @@ docker compose up --build
 
 | 文件 | 内容 |
 | --- | --- |
-| `01_schema.sql` | `CREATE TABLE`，内联主键/唯一键（不含外键） |
+| `01_schema.sql` | `CREATE TABLE`，内联主键/唯一键（不含外键）；`NULLS NOT DISTINCT` 子句原样保留 |
 | `02_data.sql` | 恰好等于请求行数的 `INSERT`，NULL 显式输出 |
 | `03_constraints.sql` | 全部外键 `ALTER TABLE ADD CONSTRAINT`（处理循环），可延迟性子句原样保留 |
-| `manifest.json` | 行数、区间、约束清单、`contains_real_patient_data=false` |
+| `manifest.json` | 行数、区间、约束清单（唯一键标注 `nulls_not_distinct` 与 NULL 语义）、`contains_real_patient_data=false` |
 | `README.md` | 装载说明 |
 
 装载：
@@ -114,6 +119,24 @@ assignment(emp_id,project_id) → employee / project              复合主键+�
 `examples/request_unsat_conflict.json`；闭包扩展示例见
 `examples/request_closure_single.json`。
 
+## NULL 唯一性示例（普通 UNIQUE vs NULLS NOT DISTINCT）
+
+演示源库还包含一张 `ticket` 表，同时声明两种 NULL 语义的唯一键：
+
+```
+ticket_locator_nnd_uk            UNIQUE NULLS NOT DISTINCT (locator_nnd)        -- 单列 NND
+ticket_locator_composite_nnd_uk  UNIQUE NULLS NOT DISTINCT (tenant_ref, locator_nnd)  -- 复合 NND
+ticket_locator_uk                UNIQUE (locator_uk)                            -- 普通 UNIQUE
+```
+
+- `examples/request_nnd_conflict.json`：请求 3 行、可空 NND 键区间仅 `[7,7]`。
+  可用的三值键只有 `{7, NULL}` 两个，作业返回 `no_solution`（区间 + NND 唯一键
+  冲突），**不发布任何放宽约束的包**，下载返回 409。
+- `examples/request_nnd_feasible.json`：同结构的可行请求。普通 UNIQUE 列可重复
+  NULL，NND 列至多一个含 NULL 的键；包内 DDL 原样保留 `NULLS NOT DISTINCT`，
+  隔离空库负向校验会额外证明「重复 NULL 被 NND 拒绝（23505）」与「普通 UNIQUE
+  允许重复 NULL」。
+
 ## 本地自测（无需 Docker）
 
 仓库测试用 `pgserver` 自带的 PostgreSQL 二进制在本机起两个实例：
@@ -137,8 +160,8 @@ PYTHONPATH=. .venv/bin/python -m pytest tests/
 
 ```
 app/            FastAPI + 内省 + z3 求解 + SQL 渲染 + 隔离库验证
-sql/            循环引用检验表源结构、源库初始化（只读角色）
-examples/       循环四表、无解冲突、闭包扩展三类请求示例
-tests/          34 个单元/集成/端到端测试（真实 PostgreSQL）
+sql/            循环引用检验表 + NULLS NOT DISTINCT 检验表源结构、源库初始化（只读角色）
+examples/       循环四表、无解冲突、闭包扩展、NND 冲突/可行五类请求示例
+tests/          48 个单元/集成/端到端测试（真实 PostgreSQL）
 docker-compose.yml / Dockerfile / requirements.txt
 ```

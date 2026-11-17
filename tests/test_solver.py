@@ -294,6 +294,183 @@ def test_zero_rows_table():
     assert out["empty_t"] == []
 
 
+def _nnd_table(name="t", key_cols=("k",), composite_partner=None):
+    columns = [col("id")]
+    uks = [UniqueConstraint(name="pk", columns=["id"], is_primary=True)]
+    if len(key_cols) == 1:
+        columns.append(col(key_cols[0], nullable=True))
+        uks.append(
+            UniqueConstraint(
+                name="uk_nnd",
+                columns=list(key_cols),
+                is_primary=False,
+                nulls_not_distinct=True,
+            )
+        )
+    else:
+        for cname in key_cols:
+            columns.append(col(cname, nullable=True))
+        uks.append(
+            UniqueConstraint(
+                name="uk_nnd",
+                columns=list(key_cols),
+                is_primary=False,
+                nulls_not_distinct=True,
+            )
+        )
+    return TableSchema(
+        schema_name="public",
+        name=name,
+        columns=columns,
+        unique_constraints=uks,
+        foreign_keys=[],
+    )
+
+
+def _ordinary_uk_table():
+    return TableSchema(
+        schema_name="public",
+        name="t",
+        columns=[col("id"), col("k", nullable=True)],
+        unique_constraints=[
+            UniqueConstraint(name="pk", columns=["id"], is_primary=True),
+            UniqueConstraint(
+                name="uk_plain", columns=["k"], is_primary=False,
+                nulls_not_distinct=False,
+            ),
+        ],
+        foreign_keys=[],
+    )
+
+
+def test_nnd_single_point_range_three_rows_is_unsat():
+    # The reported regression: 3 rows, nullable key range [7,7] under
+    # UNIQUE NULLS NOT DISTINCT. Only {7, NULL} are usable -> unsat, and the
+    # conflict must name the range plus the NND unique constraint.
+    ts = _nnd_table()
+    specs = {"t": spec("t", 3, {"id": (1, 100), "k": (7, 7)})}
+    with pytest.raises(Unsatisfiable) as exc:
+        Generator({"t": ts}, specs).solve()
+    groups = exc.value.groups
+    kinds = {g.kind for g in groups}
+    assert "unique" in kinds and "range" in kinds
+    assert any("NULLS NOT DISTINCT" in g.label for g in groups)
+
+
+def test_nnd_two_rows_single_point_uses_one_null():
+    ts = _nnd_table()
+    specs = {"t": spec("t", 2, {"id": (1, 100), "k": (7, 7)})}
+    data = Generator({"t": ts}, specs).solve()["t"]
+    keys = [r["k"] for r in data]
+    assert sorted(v for v in keys if v is not None) == [7]
+    assert sum(1 for v in keys if v is None) == 1
+
+
+def test_nnd_never_emits_duplicate_null_key():
+    ts = _nnd_table()
+    specs = {"t": spec("t", 4, {"id": (1, 100), "k": (70, 72)})}
+    data = Generator({"t": ts}, specs).solve()["t"]
+    keys = [r["k"] for r in data]
+    # Three non-NULL values plus at most one NULL under NND.
+    assert len(keys) == 4
+    assert sum(1 for v in keys if v is None) <= 1
+    non_null = [v for v in keys if v is not None]
+    assert len(non_null) == len(set(non_null))
+
+
+def test_ordinary_unique_still_allows_repeated_nulls():
+    ts = _ordinary_uk_table()
+    specs = {"t": spec("t", 3, {"id": (1, 100), "k": (7, 7)})}
+    data = Generator({"t": ts}, specs).solve()["t"]
+    # Ordinary UNIQUE: the same request stays feasible via repeated NULLs.
+    assert sum(1 for r in data if r["k"] is None) >= 2
+    assert sum(1 for r in data if r["k"] == 7) == 1
+
+
+def test_nnd_composite_treats_three_valued_keys_as_unique():
+    # (a,b) with single-point non-NULL ranges offers exactly four distinct
+    # three-valued keys: (1,2),(NULL,2),(1,NULL),(NULL,NULL).
+    ts = _nnd_table(key_cols=("a", "b"))
+    specs4 = {
+        "t": TableSpec(
+            table="t", rows=4,
+            ranges={
+                "id": IntRange(low=1, high=100),
+                "a": IntRange(low=1, high=1),
+                "b": IntRange(low=2, high=2),
+            },
+        )
+    }
+    data = Generator({"t": ts}, specs4).solve()["t"]
+    keys = [(r["a"], r["b"]) for r in data]
+    assert len(keys) == len(set(keys)) == 4
+
+    # A fifth row cannot be invented: every three-valued key is already used.
+    specs5 = {
+        "t": TableSpec(
+            table="t", rows=5,
+            ranges={
+                "id": IntRange(low=1, high=100),
+                "a": IntRange(low=1, high=1),
+                "b": IntRange(low=2, high=2),
+            },
+        )
+    }
+    with pytest.raises(Unsatisfiable) as exc:
+        Generator({"t": ts}, specs5).solve()
+    assert any("NULLS NOT DISTINCT" in g.label for g in exc.value.groups)
+
+
+def test_nnd_on_not_null_column_matches_plain_uniqueness():
+    # A NND constraint on a NOT NULL column can never use NULL, so it behaves
+    # exactly like ordinary uniqueness: feasible on a wide range, unsat when the
+    # row count exceeds the available values.
+    ts = TableSchema(
+        schema_name="public",
+        name="t",
+        columns=[col("id"), col("k")],  # k NOT NULL
+        unique_constraints=[
+            UniqueConstraint(name="pk", columns=["id"], is_primary=True),
+            UniqueConstraint(
+                name="uk_nnd", columns=["k"], is_primary=False,
+                nulls_not_distinct=True,
+            ),
+        ],
+        foreign_keys=[],
+    )
+    ok = {"t": spec("t", 3, {"id": (1, 100), "k": (7, 9)})}
+    data = Generator({"t": ts}, ok).solve()["t"]
+    assert len({r["k"] for r in data}) == 3
+    bad = {"t": spec("t", 3, {"id": (1, 100), "k": (7, 7)})}
+    with pytest.raises(Unsatisfiable):
+        Generator({"t": ts}, bad).solve()
+
+
+def test_ordinary_composite_unique_allows_repeated_null_bearing_rows():
+    ts = TableSchema(
+        schema_name="public",
+        name="t",
+        columns=[col("id"), col("a", nullable=True), col("b", nullable=True)],
+        unique_constraints=[
+            UniqueConstraint(name="pk", columns=["id"], is_primary=True),
+            UniqueConstraint(name="uk_plain", columns=["a", "b"], is_primary=False),
+        ],
+        foreign_keys=[],
+    )
+    specs = {
+        "t": TableSpec(
+            table="t", rows=5,
+            ranges={
+                "id": IntRange(low=1, high=100),
+                "a": IntRange(low=1, high=1),
+                "b": IntRange(low=2, high=2),
+            },
+        )
+    }
+    data = Generator({"t": ts}, specs).solve()["t"]
+    assert len(data) == 5  # feasible: NULL-bearing rows never collide
+
+
 def test_type_bounds_enforced():
     ts = TableSchema(
         schema_name="public",

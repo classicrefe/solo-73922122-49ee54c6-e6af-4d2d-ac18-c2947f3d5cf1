@@ -71,3 +71,27 @@ ALTER TABLE dept
     ADD CONSTRAINT dept_mgr_fk FOREIGN KEY (mgr_emp)
         REFERENCES employee (emp_id) MATCH SIMPLE
         ON DELETE SET NULL ON UPDATE CASCADE NOT DEFERRABLE;
+
+-- ============================================================
+-- NULL uniqueness exercise tables (PostgreSQL 15+ feature).
+-- Both tables hold only integer columns and zero rows, exactly like the
+-- cyclic graph above. They let a regression request prove that the service
+-- reproduces each constraint's NULL semantics instead of relaxing them:
+--   * ticket.locator_nnd: single-column UNIQUE NULLS NOT DISTINCT
+--   * ticket (tenant_ref, locator_nnd): composite UNIQUE NULLS NOT DISTINCT
+--   * ticket.locator_uk:   ordinary UNIQUE (repeated NULLs stay allowed)
+-- ============================================================
+
+CREATE TABLE ticket (
+    ticket_id     integer NOT NULL,
+    tenant_ref    integer,                       -- nullable, part of NND key
+    locator_nnd   integer,                       -- nullable unique, NND
+    locator_uk    integer,                       -- nullable unique, ordinary
+    CONSTRAINT ticket_pk PRIMARY KEY (ticket_id),
+    CONSTRAINT ticket_locator_nnd_uk
+        UNIQUE NULLS NOT DISTINCT (locator_nnd),
+    CONSTRAINT ticket_locator_composite_nnd_uk
+        UNIQUE NULLS NOT DISTINCT (tenant_ref, locator_nnd),
+    CONSTRAINT ticket_locator_uk
+        UNIQUE (locator_uk)
+);

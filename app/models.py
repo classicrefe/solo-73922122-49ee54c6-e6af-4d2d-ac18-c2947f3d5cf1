@@ -5,7 +5,9 @@ The model intentionally covers a restricted, explicitly-supported feature set:
 
 * integer columns only (smallint / integer / bigint)
 * primary keys (including composite)
-* ordinary unique constraints (including composite)
+* ordinary unique constraints (including composite), preserving each
+  constraint's NULL uniqueness: ordinary UNIQUE keeps NULLs distinct while
+  UNIQUE NULLS NOT DISTINCT treats NULLs as equal
 * nullable / NOT NULL columns
 * composite foreign keys with MATCH SIMPLE / MATCH FULL, including cycles
 
@@ -53,6 +55,11 @@ class UniqueConstraint(BaseModel):
     name: str
     columns: list[str]
     is_primary: bool
+    # SQL UNIQUE treats NULL values as distinct (repeated NULLs never collide).
+    # UNIQUE NULLS NOT DISTINCT (PG15+) instead compares NULLs as equal, so a
+    # key containing NULL may appear at most once. Primary keys stay NOT NULL
+    # and never carry this flag.
+    nulls_not_distinct: bool = False
 
 
 class ForeignKey(BaseModel):

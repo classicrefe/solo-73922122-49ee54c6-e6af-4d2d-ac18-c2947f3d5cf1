@@ -50,7 +50,15 @@ def render_schema(tables: dict[str, TableSchema], selected: list[str]) -> str:
             if uc.is_primary:
                 col_defs.append(f"    CONSTRAINT {q(uc.name)} PRIMARY KEY ({cols})")
             else:
-                col_defs.append(f"    CONSTRAINT {q(uc.name)} UNIQUE ({cols})")
+                # Reproduce the source constraint's NULL uniqueness exactly:
+                # ordinary UNIQUE keeps NULLs distinct; NULLS NOT DISTINCT must
+                # be emitted verbatim or the rebuilt table would silently relax
+                # the original constraint. The clause precedes the column list
+                # per the PostgreSQL grammar.
+                nnd = " NULLS NOT DISTINCT" if uc.nulls_not_distinct else ""
+                col_defs.append(
+                    f"    CONSTRAINT {q(uc.name)} UNIQUE{nnd} ({cols})"
+                )
         lines.append(",\n".join(col_defs))
         lines.append(");\n")
     lines.append("COMMIT;\n")
@@ -131,7 +139,20 @@ def render_manifest(
                 "primary_key": (
                     [u.name for u in tables[t].unique_constraints if u.is_primary] or None
                 ),
-                "unique": [u.name for u in tables[t].unique_constraints if not u.is_primary],
+                "unique": [
+                    {
+                        "name": u.name,
+                        "columns": u.columns,
+                        "nulls_not_distinct": u.nulls_not_distinct,
+                        "null_semantics": (
+                            "NULLS NOT DISTINCT"
+                            if u.nulls_not_distinct
+                            else "NULLS DISTINCT (ordinary SQL UNIQUE)"
+                        ),
+                    }
+                    for u in tables[t].unique_constraints
+                    if not u.is_primary
+                ],
                 "foreign_keys": [
                     {
                         "name": f.name,

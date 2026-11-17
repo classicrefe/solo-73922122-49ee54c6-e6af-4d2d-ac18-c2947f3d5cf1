@@ -174,7 +174,9 @@ def _assert_constraints_enforced(conn, schema, tables, selected, log) -> None:
 
         # --- PK / UNIQUE: force the first row's key onto a second row's key ---
         for uc in ts.unique_constraints:
-            kind = "主键" if uc.is_primary else "唯一键"
+            kind = "主键" if uc.is_primary else (
+                "唯一键[NULLS NOT DISTINCT]" if uc.nulls_not_distinct else "唯一键"
+            )
             if n_rows < 2:
                 log.append(f"skip {kind} probe {uc.name}: table has fewer than 2 rows")
                 continue
@@ -189,19 +191,64 @@ def _assert_constraints_enforced(conn, schema, tables, selected, log) -> None:
                 keyvals = cur.fetchone()
             if keyvals is None:
                 log.append(f"skip {kind} probe {uc.name}: no non-NULL key row")
-                continue
-            set_clause = ", ".join(
-                f"{q(c)} = {_lit(v)}" for c, v in zip(key_cols, keyvals)
-            )
-            # Apply to every *other* row; with >=2 rows a duplicate is forced.
-            _run_negative(
-                conn,
-                f"UPDATE {tbl} SET {set_clause} WHERE ctid NOT IN "
-                f"(SELECT ctid FROM {tbl} LIMIT 1)",
-                log,
-                f"{tname} {kind} {uc.name} 重复",
-                expect_sqlstate="23505",
-            )
+            else:
+                set_clause = ", ".join(
+                    f"{q(c)} = {_lit(v)}" for c, v in zip(key_cols, keyvals)
+                )
+                # Apply to every *other* row; with >=2 rows a duplicate is forced.
+                _run_negative(
+                    conn,
+                    f"UPDATE {tbl} SET {set_clause} WHERE ctid NOT IN "
+                    f"(SELECT ctid FROM {tbl} LIMIT 1)",
+                    log,
+                    f"{tname} {kind} {uc.name} 重复",
+                    expect_sqlstate="23505",
+                )
+
+            if uc.nulls_not_distinct:
+                # NULLS NOT DISTINCT treats NULL as an equal value: setting the
+                # whole key to NULL on every row must produce a duplicate-NULL
+                # collision (with >= 2 rows). Skip when any key column is NOT
+                # NULL (e.g. a PK-leaning layout): the non-NULL probe above then
+                # already proves enforcement, and a NULL write cannot happen.
+                if all(col_by_name[c].nullable for c in key_cols):
+                    null_set = ", ".join(f"{q(c)} = NULL" for c in key_cols)
+                    _run_negative(
+                        conn,
+                        f"UPDATE {tbl} SET {null_set}",
+                        log,
+                        f"{tname} {kind} {uc.name} 重复NULL",
+                        expect_sqlstate="23505",
+                    )
+                else:
+                    log.append(
+                        f"skip NND 重复NULL probe {uc.name}: 键列含 NOT NULL 列，NULL 写入不可能发生"
+                    )
+            elif not uc.is_primary and all(
+                col_by_name[c].nullable for c in key_cols
+            ):
+                # Ordinary UNIQUE semantics: NULLs are distinct, so writing the
+                # same all-NULL key into every row must be *accepted*. A failure
+                # here would mean the rebuilt constraint wrongly behaves like
+                # NULLS NOT DISTINCT. Blocking by another constraint is noted,
+                # not treated as a verdict.
+                null_set = ", ".join(f"{q(c)} = NULL" for c in key_cols)
+                savepoint = f"sp_{secrets.token_hex(6)}"
+                with conn.cursor() as cur:
+                    cur.execute(f"SAVEPOINT {q(savepoint)}")
+                    try:
+                        cur.execute(f"UPDATE {tbl} SET {null_set}")
+                        log.append(
+                            f"semantic probe OK [{uc.name} 普通UNIQUE 允许重复NULL]"
+                        )
+                    except psycopg.Error as exc:
+                        log.append(
+                            f"semantic probe note [{uc.name} 普通UNIQUE]: "
+                            f"blocked by another constraint {exc.sqlstate}"
+                        )
+                    finally:
+                        cur.execute(f"ROLLBACK TO SAVEPOINT {q(savepoint)}")
+                        conn.commit()
 
         # --- Foreign keys: point an existing row at a guaranteed-absent key ---
         for fk in ts.foreign_keys:

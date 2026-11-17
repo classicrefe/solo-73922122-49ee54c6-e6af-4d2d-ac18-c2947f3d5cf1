@@ -6,6 +6,14 @@ constraints (PK/UNIQUE, composite MATCH SIMPLE/FULL foreign keys, including
 self-references and cycles) are asserted as hard constraints; row counts and
 the requested closed intervals are hard constraints as well.
 
+NULL uniqueness follows the source catalog per unique constraint:
+
+* ordinary ``UNIQUE`` keeps SQL's default behaviour — NULLs are distinct, so
+  any number of rows may carry a NULL in a key column;
+* ``UNIQUE NULLS NOT DISTINCT`` treats NULLs as equal, so each distinct
+  three-valued key (including keys containing NULL) may appear at most once.
+  This holds for single-column and composite keys alike.
+
 Solving is staged:
 
 1. prefer a sample in which every nullable cell is non-NULL;
@@ -120,20 +128,33 @@ class Generator:
             for j in range(i + 1, len(rows)):
                 any_null = []
                 value_diffs = []
+                nullness_diffs = []
                 for cname in uc.columns:
                     a, b = rows[i][idx[cname]], rows[j][idx[cname]]
                     any_null.append(z3.Or(a.isnull, b.isnull))
                     value_diffs.append(a.value != b.value)
-                # SQL UNIQUE semantics: rows containing a NULL in any key
-                # column are distinct and never collide; only rows whose whole
-                # constrained key is non-NULL must differ in at least one value.
-                both_present = z3.Not(z3.Or(*any_null))
-                terms.append(
-                    z3.Implies(
-                        both_present,
-                        z3.Or(*value_diffs),
+                    # Under NULLS NOT DISTINCT, NULL vs non-NULL already makes
+                    # the column differ; two NULLs compare equal on this column.
+                    nullness_diffs.append(z3.Xor(a.isnull, b.isnull))
+                if uc.nulls_not_distinct:
+                    # UNIQUE NULLS NOT DISTINCT: NULLs compare equal. Two rows
+                    # collide only when every key column is equal in the
+                    # three-valued sense, so they must differ in at least one
+                    # column: either one is NULL where the other is not, or both
+                    # are non-NULL and hold different integers.
+                    non_null_value_diff = z3.And(
+                        z3.Not(z3.Or(*any_null)), z3.Or(*value_diffs)
                     )
-                )
+                    terms.append(
+                        z3.Or(z3.Or(*nullness_diffs), non_null_value_diff)
+                    )
+                else:
+                    # Ordinary SQL UNIQUE semantics: rows containing a NULL in
+                    # any key column are distinct and never collide; only rows
+                    # whose whole constrained key is non-NULL must differ in at
+                    # least one value.
+                    both_present = z3.Not(z3.Or(*any_null))
+                    terms.append(z3.Implies(both_present, z3.Or(*value_diffs)))
         return z3.And(*terms) if terms else z3.BoolVal(True)
 
     def _fk_constraint(self, fk: ForeignKey, ts: TableSchema) -> z3.BoolRef:
@@ -222,10 +243,18 @@ class Generator:
         # Unique constraints.
         for tname, ts in self.schemas.items():
             for uc in ts.unique_constraints:
-                kind = "主键" if uc.is_primary else "唯一键"
+                if uc.is_primary:
+                    kind = "主键"
+                    null_rule = ""
+                elif uc.nulls_not_distinct:
+                    kind = "唯一键"
+                    null_rule = " [NULLS NOT DISTINCT：NULL 视为相等，含 NULL 的键至多出现一次]"
+                else:
+                    kind = "唯一键"
+                    null_rule = " [普通 UNIQUE：多个 NULL 互不冲突]"
                 g = self._group(
                     f"unique:{tname}.{uc.name}",
-                    f"{kind}约束 {tname}.{uc.name}（列: {', '.join(uc.columns)}）",
+                    f"{kind}约束 {tname}.{uc.name}（列: {', '.join(uc.columns)}）{null_rule}",
                     "unique",
                     [tname, uc.name],
                 )

@@ -1,0 +1,16 @@
+{
+  "_comment": "NULLS NOT DISTINCT 无解示例：ticket 请求 3 行，但可空整数键 locator_nnd 的取值区间仅为 [7,7]，普通 UNIQUE 尚可让另外两行取 NULL 规避冲突，而源表约束是 UNIQUE NULLS NOT DISTINCT——NULL 视为相等、含 NULL 的键至多出现一次，因此可装载的键只有 {7, NULL} 两个，3 行必无解。作业须返回 no_solution 冲突（行数/区间/NND 唯一键），不得发布放宽为普通 UNIQUE 的包。",
+  "schema_name": "public",
+  "tables": [
+    {
+      "table": "ticket",
+      "rows": 3,
+      "ranges": {
+        "ticket_id":   {"low": 1, "high": 100},
+        "tenant_ref":  {"low": 1, "high": 100},
+        "locator_nnd": {"low": 7, "high": 7},
+        "locator_uk":  {"low": 7, "high": 7}
+      }
+    }
+  ]
+}
